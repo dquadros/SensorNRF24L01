@@ -1,0 +1,457 @@
+// Segundo teste de sensor RF usando nRF24L01+
+
+#include <msp430.h>
+
+// Algumas definições para simplificar
+
+typedef unsigned char  byte;
+
+#define _BV(b)  (1 << (b))
+
+#define delayMicroseconds(n)  __delay_cycles(n)   // 1MHz = 1uS por ciclo
+
+// Pinos utilizados
+#define LED     BIT0  // LED da Launchpad
+#define DS18B20 BIT1  // Sensor de temperatura
+#define CE      BIT2  // Sinal CE do nRF24L01+
+#define HALL    BIT3  // Sensor Hall / Botão da Launchpad
+#define CSN     BIT4  // Sinal CSN do nRF24L01+
+#define SDO     BIT6
+#define SDI     BIT7
+
+// Macros para comunicação com o DS18B20
+// Usadas para maior velocidade
+#define setDQ_LOW()  { P1DIR |= DS18B20; P1REN &= ~DS18B20; P1OUT &= ~DS18B20; }
+#define setDQ_HIGH() { P1DIR &= ~DS18B20; P1REN |= DS18B20; P1OUT |= DS18B20;  }
+
+// Comandos do nRF24L01+
+#define R_REGISTER    0x00
+#define W_REGISTER    0x20
+#define REGISTER_MASK 0x1F
+#define ACTIVATE      0x50
+#define R_RX_PL_WID   0x60
+#define R_RX_PAYLOAD  0x61
+#define W_TX_PAYLOAD  0xA0
+#define W_ACK_PAYLOAD 0xA8
+#define FLUSH_TX      0xE1
+#define FLUSH_RX      0xE2
+#define REUSE_TX_PL   0xE3
+#define NOP           0xFF
+
+// Registradores do nRF24L01+
+#define CONFIG      0x00
+#define EN_AA       0x01
+#define EN_RXADDR   0x02
+#define SETUP_AW    0x03
+#define SETUP_RETR  0x04
+#define RF_CH       0x05
+#define RF_SETUP    0x06
+#define NRF_STATUS  0x07
+#define OBSERVE_TX  0x08
+#define CD          0x09
+#define RX_ADDR_P0  0x0A
+#define RX_ADDR_P1  0x0B
+#define RX_ADDR_P2  0x0C
+#define RX_ADDR_P3  0x0D
+#define RX_ADDR_P4  0x0E
+#define RX_ADDR_P5  0x0F
+#define TX_ADDR     0x10
+#define RX_PW_P0    0x11
+#define RX_PW_P1    0x12
+#define RX_PW_P2    0x13
+#define RX_PW_P3    0x14
+#define RX_PW_P4    0x15
+#define RX_PW_P5    0x16
+#define FIFO_STATUS 0x17
+#define DYNPD	    0x1C
+#define FEATURE	    0x1D
+
+// Bits do registrador de Status
+#define RX_DR       6    // data ready
+#define TX_DS       5    // data sent
+#define MAX_RT      4    // max retransmissions
+
+// Bits do registrador CONFIG
+#define PRIM_RX     0
+#define PWR_UP      1
+
+// Endereço do Data Logger
+static byte addrLogger[6] = "DLogr";
+
+// Contador de delay
+volatile unsigned int cntDelay = 0;
+
+// Rotinas locais
+static unsigned  leTemperatura(void);
+static byte OW_Reset        (void);
+static byte OW_ReadByte     (void);
+static void OW_WriteByte    (byte valor);
+static void radioInit       (void);
+static byte txPkt           (byte *pDado);
+static void powerUp         (void);
+static byte get_status      (void);
+static byte send_command    (byte cmd);
+static byte write_register  (byte reg, byte value);
+static byte writeN_register (byte reg, byte *pValue, byte n);
+static byte read_register   (byte reg);
+static byte xferSPI         (byte dado);
+static void delay           (unsigned int cont);
+
+// Programa principal
+void main( void )
+{
+  byte pkt[3];
+  unsigned temp;
+  
+  // Desliga o watchdog timer
+  WDTCTL = WDTPW + WDTHOLD;
+
+  // Inicia os pinos
+  P1DIR = LED | CE | CSN | SDO;   // LED, CE e CSN são saída
+  P1REN = DS18B20 | HALL;   // Resistores nos sensores
+  P1OUT = DS18B20 | HALL;   // LED apagado, pullup nos sensores
+
+  // Ativa o clock de 32KHz  
+  BCSCTL1 |= DIVA_3;   // ACLK /8  
+  BCSCTL3 |= XCAP_3;   // 12.5pF  
+    
+  // inicia timer A
+  CCTL0 = CCIE;                             // CCR0 interrupt enabled  
+  CCR0 = 512;  
+  TACTL = TASSEL_1 + MC_1;                  // ACLK upmode  
+  
+  // Alimentação já deve estar estável, vamos ligar o DCO
+  BCSCTL1 = CALBC1_1MHZ | DIVA_3;
+  DCOCTL  = CALDCO_1MHZ;
+
+  // Programa USI
+      // Clock = SMCLK/2 = 1/2 MHZ = 500 KHz, ativo high
+  USICKCTL  = USIDIV0 | USISSEL1;
+      // Habilitar pinos, MSB first, Master
+  USICTL0 = USIPE7 | USIPE6 | USIPE5 | USIOE | USIMST | USISWRST;
+      // Modo SPI 0
+  USICTL1 = USICKPH;  // Lê na subida de SCK, Escreve na descida
+      // 8 bit shift register
+  USICNT = 0;
+      // Libera USI para operação
+  USICTL0  &= ~USISWRST;
+
+  // Inicia rádio
+  radioInit();
+
+  // Habilita interrupção do "sensor Hall" (por enquanto o botão)
+  P1IE |= HALL;             // permitir interrupção do sensor HALL
+  P1IES |= HALL;            // na borda de descida
+  P1IFG &= ~HALL;           // limpa a interrupção
+  
+  // Laço principal
+  while (1)
+  {
+    // Dormir até passar 5 minutos ou sensor Hall interromper
+    delay (5*60*8);
+    
+    // ler a temperatura
+    temp = leTemperatura();
+    
+    // Transmitir temperatura
+    P1OUT |= LED;             // Acende o LED
+    pkt[0] = temp >> 8;
+    pkt[1] = temp & 0xFF;
+    pkt[2] = '0';     // por enquanto sensor sempre estará low
+    txPkt (pkt);
+    P1OUT &= ~LED;            // Apaga o LED
+  }
+}
+
+// Leitura da temperatura
+// Retorna temperatura em décimos de grau
+// Considera que temos apenas um sensor conectado
+// e ele está com a configuração padrão
+// Ref: AN162 da Maxim
+static unsigned leTemperatura(void)
+{
+  unsigned valor;
+  
+  if (!OW_Reset())
+    return 0;
+  OW_WriteByte (0xCC);  // Skip ROM
+  OW_WriteByte (0x44);  // Start conversion
+  delay(8);             // aguarda fim da conversao
+  
+  OW_Reset();
+  OW_WriteByte (0xCC);  // Skip ROM
+  OW_WriteByte (0xBE);  // Read ScratchPAD
+  valor = OW_ReadByte();                 // LSB
+  valor = (OW_ReadByte() << 8) + valor;  // MSB
+  OW_Reset();           // Nao queremos o resto
+
+  valor = (valor * 100) / 16;
+  return (valor+5)/10;
+}
+
+// OneWire reset
+// Retorna true se tem um sensor conectado
+static byte OW_Reset(void)
+{
+  byte resposta;
+  
+  setDQ_LOW();
+  delayMicroseconds(500);  // comanda reset
+  setDQ_HIGH();
+  delayMicroseconds(70);      // aguarda sensor responder
+  resposta = P1IN & DS18B20;  // le a resposta
+  delayMicroseconds(500);     // aguarda fim da resposta
+  return resposta == 0;
+}
+
+// OneWire Read Byte
+static byte OW_ReadByte(void)
+{
+  byte i, resp;
+  for (i = 0; i < 8; i++)
+  {
+    // Pulso de 1uS abre janela para resposta
+    setDQ_LOW();
+    setDQ_HIGH();
+    // Dá um tempo para sensor colocar a resposta e a lê
+    delayMicroseconds(8);
+    resp = resp >> 1;
+    if ((P1IN & DS18B20) != 0)
+    {
+      resp = resp | 0x80;
+    }
+    // Aguarda o final da janela
+    delayMicroseconds(50);
+  }
+  
+  return resp;
+}
+
+// OneWire Write Byte
+static void OW_WriteByte(byte valor)
+{
+  byte i;
+  for (i = 0; i < 8; i++)
+  {
+    // Low inicia a janela
+    setDQ_LOW();
+    if (valor & 0x01)
+    {
+      // Volta o nivel alto se for "1"
+      setDQ_HIGH();
+      // Manter o bit até o final da janela
+      delayMicroseconds(90);
+    }
+    else
+    {
+      // Manter o bit até o final da janela
+      delayMicroseconds(90);
+      // Voltar ao repouso
+      setDQ_HIGH();
+    }
+    // Passar para o próximo bit
+    valor = valor >> 1;
+  }
+}
+
+// Iniciacao do Radio
+static void radioInit(void)
+{
+  // Inicia os sinais de controle
+  P1OUT &= ~CE;   // CE LOW
+  P1OUT |= CSN;   // CSN HIGH
+
+  // Configura o radio
+  delay(2);  // para o caso do radio acabar de ser ligado
+  send_command(NOP);               // Para inciar com tudo alinhado
+  write_register(CONFIG, 0x0C);    // CRC de 16 bits. Tx
+  write_register(SETUP_RETR, 0x5F);// ate 15 retries, timeout = 1,5ms
+  write_register(RF_SETUP, 0x06);  // 1Mbps, Potencia maxima
+  write_register(FEATURE,0 );      // trabalhar com pacotes de tamanho fixo
+  write_register(DYNPD,0);         // trabalhar com pacotes de tamanho fixo
+  write_register(RF_CH, 76);       // usar canal 76
+  if (read_register(RF_CH) != 76)
+  {
+    P1OUT |= LED;
+    _BIS_SR(LPM3_bits); // dormir até reset
+  }
+  send_command(FLUSH_RX);          // limpa a recepcao
+  send_command(FLUSH_TX);          // limpa a transmissao
+  write_register(NRF_STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT));
+
+  // Configura os enderecos  
+  write_register(SETUP_AW, 3);                // enderecos de 5 bytes
+  writeN_register(TX_ADDR, addrLogger, 5);    // endereco de transmissao
+  writeN_register(RX_ADDR_P0, addrLogger, 5); // auto ACK
+
+  //  Pacotes com 3 bytes de dado
+  write_register(RX_PW_P1, 3);
+
+  // Liga o rádio
+  powerUp();
+}
+
+// Envia um pacote de 3 bytes
+static byte txPkt (byte *pDado)
+{
+  byte status;
+  byte i;
+
+  // Coloca na fila os bytes a transmitir
+  P1OUT &= ~CSN;      // CSN LOW
+  xferSPI(W_TX_PAYLOAD);
+  for (i = 0; i < 3; i++)
+    xferSPI(*pDado++);
+  P1OUT |= CSN;       // CSN HIGH
+
+  // Limpa os flags no status
+  write_register(NRF_STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+  
+  // Dispara a transmissao
+  P1OUT |= CE;        // CE HIGH
+  
+  // Espera concluir
+  while ((get_status() & (_BV(TX_DS) | _BV(MAX_RT))) == 0)
+    ;
+    
+  // Desligar o transmissor
+  P1OUT &= ~CE;      // CE LOW
+
+  // desliga recepcao no pipe 0
+  write_register(EN_RXADDR,2);  
+  
+  // Verifica o resultado
+  status = write_register(NRF_STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT));
+  if( status & _BV(MAX_RT))
+  {
+    send_command(FLUSH_TX);
+    return 0;
+  }
+  else
+  {
+    return 1;
+  }
+}
+
+// Liga o radio
+static void powerUp(void)
+{
+   byte cfg = read_register(CONFIG);
+
+   // Se estava desligado, liga e espera iniciar
+   if (!(cfg & _BV(PWR_UP)))
+   {
+      write_register(CONFIG, cfg | _BV(PWR_UP));
+      delay(2);
+   }
+}
+
+// Le status do nRF24L01+
+static byte get_status(void)
+{
+  byte status;
+
+  P1OUT &= ~CSN;      // CSN LOW
+  status = xferSPI(NOP);
+  P1OUT |= CSN;       // CSN HIGH
+  return status;
+}
+
+// Envia comando ao nRF24L01+
+static byte send_command(byte cmd)
+{
+  byte status;
+
+  P1OUT &= ~CSN;      // CSN LOW
+  status = xferSPI(cmd);
+  P1OUT |= CSN;       // CSN HIGH
+  return status;
+}
+
+// Escreve um valor em um registrador do nRF24L01+
+static byte write_register(byte reg, byte value)
+{
+  byte status;
+
+  P1OUT &= ~CSN;      // CSN LOW
+  status = xferSPI( W_REGISTER | ( REGISTER_MASK & reg ) );
+  xferSPI(value);
+  P1OUT |= CSN;       // CSN HIGH
+  return status;
+}
+
+// Escreve varios valores em um registrador do nRF24L01+
+static byte writeN_register(byte reg, byte *pValue, byte n)
+{
+  byte status;
+
+  P1OUT &= ~CSN;      // CSN LOW
+  status = xferSPI( W_REGISTER | ( REGISTER_MASK & reg ) );
+  while (n--)
+    xferSPI(*pValue++);
+  P1OUT |= CSN;       // CSN HIGH
+  return status;
+}
+
+// Le um registrador do nRF24L01+
+static byte read_register(byte reg)
+{
+  byte result;
+
+  P1OUT &= ~CSN;      // CSN LOW
+  result = xferSPI( R_REGISTER | ( REGISTER_MASK & reg ) );
+  result = xferSPI(0xff);
+  P1OUT |= CSN;       // CSN HIGH
+  return result;  
+}
+
+// Transfere um byte pela SPI
+static byte xferSPI (byte dado)
+{
+  // Envia o dado
+  USISRL = dado;
+  USICNT = 8;
+  
+  // espera fim da transferência
+  while ((USICTL1 & USIIFG) == 0)
+    ;
+  
+  // retorna o byte recebido
+  return USISRL;
+}
+
+// Delay de cont/8 segundos
+// pode ser interrompido pelo sensor hall
+static void delay (unsigned int cont)
+{
+  cntDelay = cont;
+  _BIS_SR(LPM3_bits + GIE); // Dormir até ser interrompido
+}
+
+// Interrupção do sensor Hall
+#pragma vector=PORT1_VECTOR
+__interrupt void SensorHall(void)
+{
+  // Limpa a interrupção
+  P1IFG &= ~HALL;
+  
+  // Acorda o programa principal
+  // com interrupções inibidas
+  _BIC_SR_IRQ(LPM3_bits + GIE);
+}
+
+// Timer A interrupt service routine  
+// Ocorre a cada 32768/8/512 = 1/8 segundo  
+#pragma vector=TIMERA0_VECTOR  
+__interrupt void Timer( void )  
+{
+  if (cntDelay != 0)
+  {
+    if (--cntDelay == 0)
+    {
+      // Acorda o programa principal
+      // com interrupções inibidas
+      _BIC_SR_IRQ(LPM3_bits + GIE);
+    }
+  }
+}
